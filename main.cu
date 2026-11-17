@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <cuda_gl_interop.h>
+#include <curand.h>
 
 #include <raylib.h>
 
@@ -16,30 +17,29 @@
 constexpr unsigned INITIAL_WINDOW_WIDTH = 1280;
 constexpr unsigned INITIAL_WINDOW_HEIGHT = 720;
 
-constexpr float MIN_ZOOM = 0.25f;
-constexpr float MAX_ZOOM = 8.0f;
+constexpr float MIN_ZOOM = 0.2f;
+constexpr float MAX_ZOOM = 12.0f;
 constexpr float ZOOM_STRENGTH = 1.1f;
 
 constexpr char APPLICATION_NAME[] = "CUDA + Raylib Rigidbody Simulation";
 
 // --- Simulation settings ---
 
-constexpr float SIM_WIDTH = 1600.0f;
-constexpr float SIM_HEIGHT = 900.0f;
+constexpr float SIM_WIDTH = 2400.0f;
+constexpr float SIM_HEIGHT = 1350.0f;
 
-constexpr unsigned OBJECT_COUNT = 480;
-constexpr float OBJECT_RADIUS = 18.0f;
+constexpr unsigned OBJECT_COUNT = 3000;
+constexpr float OBJECT_RADIUS = 8.0f;
 
-// Run the physics simulation in fixed timesteps, independent of the frame rate.
-// If a frame takes longer than a physics time step, then a frame may run at
-// most two physics steps. If more were allowed, it could create a chain
-// reaction of slower and slower frames.
+// Run the physics steps at a fixed rate. If a frame takes longer than one
+// physics step, allow it to run at most 2 steps to catch up. If we allowed
+// more, it could create a chain reaction of longer and longer frame times.
 constexpr float PHYSICS_DT = 1.0f / 60.0f;
 constexpr float MAX_FRAME_TIME = 2.0f * PHYSICS_DT;
 
 constexpr float GRAVITY = 180.0f;
 constexpr float WALL_BOUNCE = 0.3f;
-constexpr float OBJECT_BOUNCE = 0.2f;
+constexpr float OBJECT_BOUNCE = 0.0f;
 
 // Add a very small amount of damping; this allows the objects to settle without
 // wiggling forever.
@@ -47,10 +47,13 @@ constexpr float DAMPING_PER_STEP = 0.999f;
 constexpr float MAX_SPEED = 900.0f;
 
 // Limit the correction factor so tightly packed objects don't explode.
-constexpr float MAX_CORRECTION = 2.0f;
+constexpr float MAX_CORRECTION = 1.0f;
 
 // Threads per block for both kernels.
 constexpr unsigned THREADS_PER_BLOCK = 256;
+
+// X offset, Y offset, red, green, and blue color.
+constexpr unsigned QUASIRANDOM_DIMENSIONS = 5;
 
 // --- Data structures ---
 
@@ -74,6 +77,14 @@ struct RenderTarget {
   Texture2D texture;
   cudaGraphicsResource *resource;
   unsigned width, height;
+};
+
+// Represents the state of the simulation.
+struct SimState {
+  SimBall *buf_a;
+  SimBall *buf_b;
+  unsigned block_count;
+  unsigned long long rng_offset;
 };
 
 // --- Device utility functions ---
@@ -168,8 +179,6 @@ __global__ void step_sim(const SimBall *const objects_in,
   float new_vx = obj_a.velocity.x;
   float new_vy = obj_a.velocity.y;
 
-  // Loop through all other objects. This is naive and does not scale well, but
-  // is simple and works well for a few hundred objects.
   for (unsigned i = 0; i < object_count; i++) {
     if (i == thread_index)
       continue;
@@ -268,7 +277,7 @@ __global__ void draw_objects(const cudaSurfaceObject_t surface,
 
   if (inWorld) {
     for (unsigned i = 0; i < OBJECT_COUNT; i++) {
-      SimBall obj = objects[i];
+      const SimBall obj = objects[i];
       const float dx = px - obj.position.x;
       const float dy = py - obj.position.y;
       // If the pixel is inside the circle, make it the color of the object.
@@ -289,6 +298,14 @@ __global__ void draw_objects(const cudaSurfaceObject_t surface,
 void check_cuda(cudaError err) {
   if (err != cudaSuccess) {
     std::fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
+    std::exit(1);
+  }
+}
+
+// Utility function to exit upon cuRAND errors.
+void check_curand(curandStatus_t status) {
+  if (status != CURAND_STATUS_SUCCESS) {
+    std::fprintf(stderr, "cuRAND error: %d\n", (int)status);
     std::exit(1);
   }
 }
@@ -316,6 +333,107 @@ SimCamera setup_camera() {
   const float y = (SIM_HEIGHT - (float)GetScreenHeight() / zoom) * 0.5f;
 
   return {x, y, zoom};
+}
+
+// --- Simulation state ---
+
+// Creates a quasirandom distribution of objects inside the simulation
+// boundaries.
+std::vector<SimBall>
+fill_objects_quasirandom(const unsigned long long rng_offset) {
+  std::vector<float> points(QUASIRANDOM_DIMENSIONS * OBJECT_COUNT);
+
+  // Generate quasirandom data of the correct dimensions.
+  curandGenerator_t generator;
+  check_curand(
+      curandCreateGenerator(&generator, CURAND_RNG_QUASI_SCRAMBLED_SOBOL32));
+  check_curand(curandSetQuasiRandomGeneratorDimensions(generator,
+                                                       QUASIRANDOM_DIMENSIONS));
+  check_curand(curandSetGeneratorOffset(generator, rng_offset));
+  check_curand(curandGenerateUniform(generator, points.data(),
+                                     QUASIRANDOM_DIMENSIONS * OBJECT_COUNT));
+  check_curand(curandDestroyGenerator(generator));
+
+  // The data is laid out contiguously with each dimension together.
+  const float *offset_x = points.data();
+  const float *offset_y = points.data() + OBJECT_COUNT;
+  const float *color_r = points.data() + 2 * OBJECT_COUNT;
+  const float *color_g = points.data() + 3 * OBJECT_COUNT;
+  const float *color_b = points.data() + 4 * OBJECT_COUNT;
+
+  // Use the quasirandom data to nudge the points off of their grid lines. If we
+  // just used pure quasirandom points then some objects would overlap.
+  const unsigned grid_cols =
+      std::sqrt(OBJECT_COUNT * SIM_WIDTH / SIM_HEIGHT) + 0.5f;
+  const unsigned grid_rows = ceil_div(OBJECT_COUNT, grid_cols);
+  const float cell_width = SIM_WIDTH / grid_cols;
+  const float cell_height = SIM_HEIGHT / grid_rows;
+
+  // Maintain a gap between objects.
+  const float gap_x = std::max(cell_width - 2.0f * OBJECT_RADIUS - 0.5f, 0.0f);
+  const float gap_y = std::max(cell_height - 2.0f * OBJECT_RADIUS - 0.5f, 0.0f);
+
+  std::vector<SimBall> objects(OBJECT_COUNT);
+  for (unsigned i = 0; i < OBJECT_COUNT; i++) {
+    const float x =
+        ((i % grid_cols) + 0.5f) * cell_width + (offset_x[i] - 0.5f) * gap_x;
+    const float y =
+        ((i / grid_cols) + 0.5f) * cell_height + (offset_y[i] - 0.5f) * gap_y;
+
+    // Use the random data to generate a unique color.
+    const uchar4 color =
+        make_uchar4((unsigned char)(60 + 195 * color_r[i]),
+                    (unsigned char)(60 + 195 * color_g[i]),
+                    (unsigned char)(80 + 175 * color_b[i]), 255);
+
+    objects[i] = {make_float2(x, y), make_float2(0.0f, 0.0f), OBJECT_RADIUS,
+                  color};
+  }
+
+  return objects;
+}
+
+// Initializes the simulation state and copies data to the GPU using a double
+// buffer.
+SimState create_simulation() {
+  SimState sim;
+  sim.block_count = ceil_div(OBJECT_COUNT, THREADS_PER_BLOCK);
+  sim.rng_offset = 0;
+
+  std::vector<SimBall> objects = fill_objects_quasirandom(sim.rng_offset);
+
+  check_cuda(cudaMalloc(&sim.buf_a, OBJECT_COUNT * sizeof(*sim.buf_a)));
+  check_cuda(cudaMalloc(&sim.buf_b, OBJECT_COUNT * sizeof(*sim.buf_b)));
+  check_cuda(cudaMemcpy(sim.buf_a, objects.data(),
+                        OBJECT_COUNT * sizeof(*sim.buf_a),
+                        cudaMemcpyHostToDevice));
+
+  return sim;
+}
+
+// Resets the simulation state, but creates a new RNG offset to randomize object
+// positions.
+void reset_simulation(SimState &sim) {
+  sim.rng_offset += QUASIRANDOM_DIMENSIONS * OBJECT_COUNT;
+
+  const std::vector<SimBall> objects = fill_objects_quasirandom(sim.rng_offset);
+  check_cuda(cudaMemcpy(sim.buf_a, objects.data(),
+                        OBJECT_COUNT * sizeof(*sim.buf_a),
+                        cudaMemcpyHostToDevice));
+}
+
+// Runs one physics step.
+void step_simulation(SimState &sim) {
+  step_sim<<<sim.block_count, THREADS_PER_BLOCK>>>(sim.buf_a, sim.buf_b,
+                                                   OBJECT_COUNT, PHYSICS_DT);
+  check_cuda(cudaGetLastError());
+  std::swap(sim.buf_a, sim.buf_b);
+}
+
+// Frees the simulation GPU buffers.
+void destroy_simulation(SimState &sim) {
+  check_cuda(cudaFree(sim.buf_a));
+  check_cuda(cudaFree(sim.buf_b));
 }
 
 // --- Frame handlers ---
@@ -395,7 +513,8 @@ void draw_simulation(RenderTarget &target, const SimBall *const objects,
 // Called each frame. Draws the text in the top left.
 void draw_hud() {
   DrawText(APPLICATION_NAME, 12, 12, 20, RAYWHITE);
-  DrawText(TextFormat("%u objects - drag to pan, scroll to zoom", OBJECT_COUNT),
+  DrawText(TextFormat("%u objects - drag to pan, scroll to zoom, R to reset",
+                      OBJECT_COUNT),
            12, 36, 16, LIGHTGRAY);
   DrawText(TextFormat("%i FPS", GetFPS()), 12, 58, 16, LIGHTGRAY);
 }
@@ -421,8 +540,7 @@ void destroy_texture(RenderTarget &target) {
 
 // Called each frame.
 void frame(Vector2 &last_mouse_pos, SimCamera &camera, double &unsimulated_time,
-           RenderTarget &target, SimBall *&current_obj, SimBall *&next_obj,
-           const unsigned block_count) {
+           RenderTarget &target, SimState &sim) {
   // Handle accumulated time.
   const float frame_time = std::min(GetFrameTime(), MAX_FRAME_TIME);
   unsimulated_time += frame_time;
@@ -438,45 +556,24 @@ void frame(Vector2 &last_mouse_pos, SimCamera &camera, double &unsimulated_time,
 
   handle_camera(last_mouse_pos, camera);
 
+  // Restart the simulation when the R key is pressed.
+  if (IsKeyPressed(KEY_R))
+    reset_simulation(sim);
+
   // Run physics steps for the accumulated time.
   while (unsimulated_time >= PHYSICS_DT) {
-    step_sim<<<block_count, THREADS_PER_BLOCK>>>(current_obj, next_obj,
-                                                 OBJECT_COUNT, PHYSICS_DT);
-    check_cuda(cudaGetLastError());
-    std::swap(current_obj, next_obj);
+    step_simulation(sim);
     unsimulated_time -= PHYSICS_DT;
   }
 
   BeginDrawing();
 
   ClearBackground(BLACK);
-  draw_simulation(target, current_obj, camera);
 
+  draw_simulation(target, sim.buf_a, camera);
   draw_hud();
 
   EndDrawing();
-}
-
-// Creates a vector of objects with random colors in a grid pattern.
-std::vector<SimBall> create_initial_objects() {
-  constexpr unsigned GRID_COLS = 24;
-  constexpr unsigned GRID_ROWS = OBJECT_COUNT / GRID_COLS;
-
-  static_assert(GRID_COLS * GRID_ROWS == OBJECT_COUNT);
-
-  std::vector<SimBall> objects(OBJECT_COUNT);
-
-  for (unsigned i = 0; i < OBJECT_COUNT; i++) {
-    const float grid_x = ((i % GRID_COLS) + 0.5f) * (SIM_WIDTH / GRID_COLS);
-    const float grid_y = ((i / GRID_COLS) + 0.5f) * (SIM_HEIGHT / GRID_ROWS);
-    // Use a deterministic object color based on the index.
-    const uchar4 color = make_uchar4(70 + (i * 37) % 170, 80 + (i * 61) % 160,
-                                     100 + (i * 23) % 150, 255);
-    objects[i] = {make_float2(grid_x, grid_y), make_float2(0.0f, 0.0f),
-                  OBJECT_RADIUS, color};
-  }
-
-  return objects;
 }
 
 int main() {
@@ -496,21 +593,8 @@ int main() {
   RenderTarget target;
   create_texture(target, INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT);
 
-  // Create initial objects and copy to a double buffer on the GPU.
-  std::vector<SimBall> objects = create_initial_objects();
-  SimBall *buf_a;
-  SimBall *buf_b;
-  check_cuda(cudaMalloc(&buf_a, OBJECT_COUNT * sizeof(*buf_a)));
-  check_cuda(cudaMalloc(&buf_b, OBJECT_COUNT * sizeof(*buf_b)));
-  check_cuda(cudaMemcpy(buf_a, objects.data(), OBJECT_COUNT * sizeof(*buf_a),
-                        cudaMemcpyHostToDevice));
-
-  // Deallocate host object buffer as it is no longer needed.
-  std::vector<SimBall>().swap(objects);
-
-  SimBall *current_obj = buf_a;
-  SimBall *next_obj = buf_b;
-  const unsigned block_count = ceil_div(OBJECT_COUNT, THREADS_PER_BLOCK);
+  // Create simulation state on the GPU.
+  SimState sim = create_simulation();
 
   // State for each frame.
   SimCamera camera = setup_camera();
@@ -519,14 +603,11 @@ int main() {
 
   // Main window loop.
   while (!WindowShouldClose()) {
-    frame(last_mouse_pos, camera, unsimulated_time, target, current_obj,
-          next_obj, block_count);
+    frame(last_mouse_pos, camera, unsimulated_time, target, sim);
   }
 
   destroy_texture(target);
-
-  check_cuda(cudaFree(buf_a));
-  check_cuda(cudaFree(buf_b));
+  destroy_simulation(sim);
 
   CloseWindow();
 

@@ -14,6 +14,7 @@
       with cuda; [
         cuda_nvcc
         cuda_cudart
+        libcurand
         raylib
         gnumake
       ];
