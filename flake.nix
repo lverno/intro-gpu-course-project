@@ -10,15 +10,14 @@
     cuda = pkgs.cudaPackages_13_2;
   in {
     devShells.${system}.default = pkgs.mkShell {
-      packages = with pkgs;
-      with cuda; [
+      packages = with (pkgs // cuda); [
         cuda_nvcc
         cuda_cudart
         libcurand
         raylib
         gnumake
       ];
-      LD_LIBRARY_PATH = "${pkgs.linuxPackages.nvidiaPackages.stable}/lib";
+      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [pkgs.linuxPackages.nvidiaPackages.stable];
     };
   };
 }
