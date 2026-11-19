@@ -1,6 +1,8 @@
 # CUDA Rigidbody Simulation
 
-This project implements a basic rigidbody simulation of 2D balls including gravity, collisions, friction, and bounce. To achieve high performance with millions of objects, the world is partitioned into a grid where each cell tracks its containing objects. This allows efficient lookup of nearby objects for collisions, which would otherwise be an O(n^2) algorithm. Additionally, I use CUDA to draw directly to a Raylib texture to render objects, which means drawing performance scales with the number of pixels rather than the number of objects. If I were to have used meshes instead, performance would not scale up to millions (even using instanced meshes).
+This project implements a basic rigidbody simulation of 2D balls including gravity, collisions, friction, and bounce. To achieve high performance with millions of objects, the world is partitioned into a grid where each cell tracks its containing objects. This allows efficient lookup of nearby objects for collisions, which would otherwise be an O(n^2) algorithm. Additionally, I use CUDA to draw directly to a Raylib texture through CUDA/OpenGL interop to render objects, which means drawing performance scales with the number of pixels rather than the number of objects. If I were to have used meshes instead, performance would not scale up to millions (even using instanced meshes).
+
+The most important parts to review are the grid building kernels (`build_object_grid`) and the physics kernel (`physics_step`).
 
 ## Dependencies
 
