@@ -475,7 +475,7 @@ __device__ void handle_wall_collision(float2 &position, float2 &velocity) {
 // Called in each simulation step and uses one thread per object. Uses the
 // object grid data to efficiently loop through nearby objects and perform
 // physics calculations.
-__global__ void move_objects(const SimObject *const objects_in,
+__global__ void physics_step(const SimObject *const objects_in,
                              SimObject *const objects_out,
                              const unsigned object_count, const float dt,
                              const int *const cell_slice_starts,
@@ -892,7 +892,7 @@ void reset_simulation(SimState &sim) {
 void step_simulation(SimState &sim) {
   build_object_grid(sim);
 
-  move_objects<<<sim.object_block_count, THREADS_PER_BLOCK>>>(
+  physics_step<<<sim.object_block_count, THREADS_PER_BLOCK>>>(
       sim.objects_a, sim.objects_b, OBJECT_COUNT, TIME_STEP,
       sim.cell_slice_starts, sim.cell_object_idxs);
   check_cuda(cudaGetLastError());
